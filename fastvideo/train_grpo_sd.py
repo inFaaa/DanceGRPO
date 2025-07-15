@@ -259,46 +259,22 @@ def main(_):
         eps=config.train.adam_epsilon,
     )
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # prepare prompt and reward fn
-    from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
-    from typing import Union
-    import huggingface_hub
-    from hpsv2.utils import root_path, hps_version_map
-    def initialize_model():
-        model_dict = {}
-        model, preprocess_train, preprocess_val = create_model_and_transforms(
-            'ViT-H-14',
-            './hps_ckpt/open_clip_pytorch_model.bin',
-            precision='amp',
-            device=device,
-            jit=False,
-            force_quick_gelu=False,
-            force_custom_text=False,
-            force_patch_dropout=False,
-            force_image_size=None,
-            pretrained_image=False,
-            image_mean=None,
-            image_std=None,
-            light_augmentation=True,
-            aug_cfg={},
-            output_dict=True,
-            with_score_predictor=False,
-            with_region_predictor=False
-        )
-        model_dict['model'] = model
-        model_dict['preprocess_val'] = preprocess_val
-        return model_dict
-    model_dict = initialize_model()
-    model = model_dict['model']
-    preprocess_val = model_dict['preprocess_val']
-    #cp = huggingface_hub.hf_hub_download("xswu/HPSv2", hps_version_map["v2.1"])
-    cp = "./hps_ckpt/HPS_v2.1_compressed.pt"
-
-    checkpoint = torch.load(cp, map_location=f'cuda')
-    model.load_state_dict(checkpoint['state_dict'])
-    processor = get_tokenizer('ViT-H-14')
-    reward_model = model.to(device)
-    reward_model.eval()
+    
+    # Initialize reward model using the modular reward system
+    from fastvideo.reward.rewards import multi_score
+    
+    # Get reward configuration from config, with fallback to HPS
+    if hasattr(config, 'reward_fn') and config.reward_fn:
+        reward_fn_dict = config.reward_fn
+    else:
+        # Default to HPS for backward compatibility
+        reward_fn_dict = {"hps": 1.0}
+    
+    logger.info(f"Initializing reward model with: {reward_fn_dict}")
+    reward_model = multi_score(device, reward_fn_dict)
+    
+    # Create images directory for saving generated images
+    os.makedirs("./images_same_3", exist_ok=True)
     
     #prompt_fn = getattr(ddpo_pytorch.prompts, config.prompt_fn)
 
@@ -402,6 +378,7 @@ def main(_):
         all_log_probs = []
         all_rewards = []
         all_prompts_embed = []
+        all_detailed_rewards = []
 
         ###for the sake of convenience, we use the same latents for all prompts in a batch.
         global_input_latents = torch.randn(
@@ -437,32 +414,36 @@ def main(_):
                         output_type="pt",
                         latents=input_latents
                     )
-            rewards = []
-            tuwen_rewards = []
+            # Convert images to PIL format for reward calculation
+            pil_images = []
             for j, image in enumerate(images):
                 pil = Image.fromarray(
                     (image.to(torch.float32).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
                 pil = pil.resize((512, 512))
-                image_path = os.path.join("./images_same", f"image-{i}-{j}-rank-{dist.get_rank()}.jpg")
+                image_path = os.path.join("./images_same_3", f"image-{i}-{j}-rank-{dist.get_rank()}.jpg")
                 pil.save(image_path)
-                image = preprocess_val(Image.open(image_path).convert("RGB")).unsqueeze(0).to(device=device, non_blocking=True)
-                # Process the prompt
-                text = processor([current_batch[j]]).to(device=device, non_blocking=True)
-                # Calculate the HPS
-                with torch.no_grad():
-                    with torch.amp.autocast('cuda'):
-                        outputs = reward_model(image, text)
-                        image_features, text_features = outputs["image_features"], outputs["text_features"]
-                        logits_per_image = image_features @ text_features.T
-                        hps_score = torch.diagonal(logits_per_image)
-                    rewards.append(hps_score)
+                pil_images.append(pil)
+
+            # Use the modular reward system to calculate rewards
+            with torch.no_grad():
+                rewards_dict, _ = reward_model(pil_images, current_batch, [{}] * len(current_batch))
+                
+                # Store detailed reward information for logging
+                batch_reward_details = {}
+                for key, values in rewards_dict.items():
+                    batch_reward_details[key] = torch.tensor(values, device=device, dtype=torch.float32)
+                
+                # Extract the final aggregated reward score
+                final_reward = rewards_dict['avg']
+                rewards = [torch.tensor(score, device=device, dtype=torch.float32) for score in final_reward]
+                all_detailed_rewards.append(batch_reward_details)
 
 
 
             latents = torch.stack(latents, dim=1).detach()     # (4, num_steps+1, ...)
             log_probs = torch.stack(log_probs, dim=1).detach()   # (4, num_steps, ...)
-            rewards = torch.cat(rewards, dim=0)  
+            rewards = torch.stack(rewards, dim=0)  
             
 
             all_latents.append(latents)
@@ -477,9 +458,15 @@ def main(_):
         all_log_probs = torch.cat(all_log_probs, dim=0)
         all_rewards = torch.cat(all_rewards, dim=0).to(torch.float32)
         all_prompts_embed = torch.cat(all_prompts_embed, dim=0)
+        
+        # Process detailed rewards for return
+        detailed_rewards = {}
+        for key in all_detailed_rewards[0].keys():
+            detailed_rewards[key] = torch.cat([r[key] for r in all_detailed_rewards], dim=0)
+        
         timesteps = pipeline.scheduler.timesteps.repeat(
             config.sample.batch_size*config.num_generations, 1
-        ) 
+        )
 
         # compute rewards asynchronously
         #rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
@@ -502,21 +489,110 @@ def main(_):
         # gather rewards across processes
         all_rewards_world = gather_tensor(all_rewards)
 
-        # log rewards and images
-        accelerator.log(
-            {
-                "reward": all_rewards_world,
-                "epoch": epoch,
-                "reward_mean": all_rewards_world.mean(),
-                "reward_std": all_rewards_world.std(),
-            },
-            step=global_step,
-        )
+        # Gather detailed rewards across processes
+        gathered_detailed_rewards = {}
+        for key, values in detailed_rewards.items():
+            gathered_detailed_rewards[key] = gather_tensor(values)
 
         if dist.get_rank()==0:
-            print("gathered_reward", all_rewards_world)
-            with open('./reward.txt', 'a') as f:  # 'a'模式表示追加到文件末尾
+            print("gathered_total_reward", all_rewards_world)
+            print("gathered_detailed_rewards", {k: v.mean().item() for k, v in gathered_detailed_rewards.items()})
+            
+            # Write total reward to file for backward compatibility
+            with open('./reward.txt', 'a') as f: 
                 f.write(f"{all_rewards_world.mean().item()}\n")
+
+            # Write detailed rewards to separate files
+            for reward_type, values in gathered_detailed_rewards.items():
+                if reward_type != 'avg':  # Skip avg as it's the same as total
+                    with open(f'./{reward_type}_reward.txt', 'a') as f:
+                        f.write(f"{values.mean().item()}\n")
+
+        # Prepare reward logging dict
+        reward_logs = {}
+        for reward_type, values in gathered_detailed_rewards.items():
+            reward_logs[f"reward_{reward_type}_mean"] = values.mean().item()
+            reward_logs[f"reward_{reward_type}_std"] = values.std().item()
+            reward_logs[f"reward_{reward_type}_min"] = values.min().item()
+            reward_logs[f"reward_{reward_type}_max"] = values.max().item()
+
+        # Enhanced image visualization logging similar to flow_grpo
+        if epoch % 10 == 0 and accelerator.is_main_process:
+            # Convert last batch images for visualization
+            last_batch_images = []
+            last_batch_prompts = []
+            last_batch_rewards = {}
+            
+            # Get the most recent images from the last batch
+            for j, image in enumerate(images[-min(15, len(images)):]):  # Last 15 images or fewer
+                pil = Image.fromarray(
+                    (image.to(torch.float32).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                )
+                pil = pil.resize((512, 512))
+                last_batch_images.append(pil)
+                # Get corresponding prompt and rewards
+                prompt_idx = len(images) - min(15, len(images)) + j
+                if prompt_idx < len(expanded_prompts):
+                    last_batch_prompts.append(expanded_prompts[prompt_idx])
+                else:
+                    last_batch_prompts.append("Unknown prompt")
+            
+            # Get corresponding rewards for visualization
+            for key, values in gathered_detailed_rewards.items():
+                last_batch_rewards[key] = values[-min(15, len(values)):]
+            
+            # Log images with rich captions using temporary directory
+            with tempfile.TemporaryDirectory() as tmpdir:
+                wandb_images = []
+                for idx, (image, prompt) in enumerate(zip(last_batch_images, last_batch_prompts)):
+                    # Save image as JPEG for efficient storage
+                    image_path = os.path.join(tmpdir, f"{idx}.jpg")
+                    image.save(image_path, "JPEG", quality=95)
+                    
+                    # Create rich captions with detailed reward information
+                    prompt_short = prompt[:100] + "..." if len(prompt) > 100 else prompt
+                    
+                    # Build reward string from all available rewards
+                    reward_parts = []
+                    for reward_type, values in last_batch_rewards.items():
+                        if idx < len(values):
+                            reward_val = values[idx].item() if hasattr(values[idx], 'item') else values[idx]
+                            reward_parts.append(f"{reward_type}: {reward_val:.2f}")
+                    
+                    reward_str = " | ".join(reward_parts) if reward_parts else "No rewards"
+                    caption = f"{prompt_short} | {reward_str}"
+                    
+                    wandb_images.append(
+                        wandb.Image(
+                            image_path,
+                            caption=caption
+                        )
+                    )
+                
+                # Log the images along with other metrics
+                accelerator.log(
+                    {
+                        "training_images": wandb_images,
+                        "reward": all_rewards_world,
+                        "epoch": epoch,
+                        "reward_mean": all_rewards_world.mean(),
+                        "reward_std": all_rewards_world.std(),
+                        **reward_logs,  # Add detailed reward tracking
+                    },
+                    step=global_step,
+                )
+        else:
+            # Log rewards without images for non-visualization epochs
+            accelerator.log(
+                {
+                    "reward": all_rewards_world,
+                    "epoch": epoch,
+                    "reward_mean": all_rewards_world.mean(),
+                    "reward_std": all_rewards_world.std(),
+                    **reward_logs,  # Add detailed reward tracking
+                },
+                step=global_step,
+            )
 
         #samples = {k: v.cuda() for k, v in samples.items()}  # 假设原始数据在GPU
         #samples = process_samples(samples, config)
@@ -679,7 +755,6 @@ def main(_):
                     print("reward", sample["rewards"])
                     print("ratio", ratio)
                     print("final advantage", advantages)
-                    print("hps_advantage", sample["advantages"])
                     print("final loss", loss)
                 dist.barrier()
 
